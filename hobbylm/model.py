@@ -26,7 +26,6 @@ from .moe import MoE, SwiGLUWeights
 @torch.library.custom_op("moelab::mm_t", mutates_args=())
 def _mm_t(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor, Tensor]:
     """y = x @ w with x:(M,in), w:(in,out). Returns (y_bf16, x_f8, w_f8) for backward reuse."""
-    @torch.compile
     def impl(x: Tensor, w: Tensor):
         x_f8 = x.div(x_s).to(torch.float8_e4m3fn)
         w_f8 = w.div(w_s).to(torch.float8_e4m3fn)
@@ -46,7 +45,6 @@ def _(x: Tensor, w: Tensor, *_):
 
 @torch.library.custom_op("moelab::mm_t_backward", mutates_args=())
 def _mm_t_backward(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor]:
-    @torch.compile
     def impl(g: Tensor, x_f8: Tensor, w_f8: Tensor):
         x_scale = g.new_tensor(x_s, dtype=torch.float32)
         w_scale = g.new_tensor(w_s, dtype=torch.float32)
@@ -209,7 +207,7 @@ class Attention(nn.Module):
             self.q_norm = RMSNorm(self.hd)
             self.k_norm = RMSNorm(self.hd)
 
-    def forward(self, x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    def forward(self, x: Tensor, cos: Tensor, sin: Tensor, attn_bias: Tensor | None = None) -> Tensor:
         B, S, _ = x.shape
         qkv = self.qkv(x)
         q, k, v = qkv.split([self.nq * self.hd, self.nkv * self.hd, self.nkv * self.hd], dim=-1)
@@ -222,8 +220,12 @@ class Attention(nn.Module):
         # GQA: expand kv heads to match q heads
         k = k.repeat_interleave(self.rep, dim=1)
         v = v.repeat_interleave(self.rep, dim=1)
-        # diffusion (LLaDA) models see the whole noised canvas -> bidirectional; AR stays causal.
-        o = F.scaled_dot_product_attention(q, k, v, is_causal=not self.cfg.diffusion)
+        if attn_bias is not None:
+            # explicit additive mask (e.g. padding mask for embeddings, hobbylm/embed.py) overrides is_causal.
+            o = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias, is_causal=False)
+        else:
+            # diffusion (LLaDA) models see the whole noised canvas -> bidirectional; AR stays causal.
+            o = F.scaled_dot_product_attention(q, k, v, is_causal=not self.cfg.diffusion)
         o = o.transpose(1, 2).reshape(B, S, self.nq * self.hd)
         return self.proj(o)
 
@@ -248,8 +250,8 @@ class Block(nn.Module):
         self.is_moe = layer_idx >= cfg.n_dense_layers
         self.ffn = MoE(cfg) if self.is_moe else DenseFFN(cfg)
 
-    def forward(self, x: Tensor, cos: Tensor, sin: Tensor):
-        x = x + self.attn(self.attn_norm(x), cos, sin)
+    def forward(self, x: Tensor, cos: Tensor, sin: Tensor, attn_bias: Tensor | None = None):
+        x = x + self.attn(self.attn_norm(x), cos, sin, attn_bias=attn_bias)
         if self.is_moe:
             out, aux = self.ffn(self.ffn_norm(x))
             return x + out, aux
